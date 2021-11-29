@@ -7,12 +7,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ops.part_fusion import CONV1d_FusionBlock, CONV1d_Channel_FusionBlock, \
-    CONV3d_FusionBlock, Emulated_two_stream, FEX
+from ops.fex import FEX
 
 
 class TemporalShift(nn.Module):
-    def __init__(self, net, n_segment=3, n_div=8, inplace=False, comu_type='replace', borrow_BN=False, is_first_block=False):
+    def __init__(self, net, n_segment=3, n_div=8, inplace=False, comu_type='replace', is_first_block=False):
         super(TemporalShift, self).__init__()
         self.net = net
         self.n_segment = n_segment
@@ -20,41 +19,9 @@ class TemporalShift(nn.Module):
         self.inplace = inplace
 
         self.comu_type = comu_type
-        self.borrow_BN = borrow_BN
         # self.is_first_block = is_first_block
 
-        if self.borrow_BN:
-            inchannels = net.out_channels
-            print('=> Using Borrow BN layers')
-        else:
-            inchannels = net.in_channels
-
-        if self.comu_type == 'replace':
-            print('=> Using TSM')
-        # elif self.comu_type == 'lstm_inblock':
-        #     print('=> Using LSTM_FusionBlock after res-convolution, layer number is 2')
-        #     self.shift_block = LSTM_FusionBlock(in_channels=net.out_channels, n_segment=n_segment, n_div=n_div,
-        #                                         n_layers=2)
-        # elif self.comu_type == 'lstm_outblock':
-        #     print('=> Using LSTM_FusionBlock before res-convolution, layer number is 1')
-        #     self.shift_block = LSTM_FusionBlock(in_channels=net.in_channels, n_segment=n_segment, n_div=n_div,
-        #                                         n_layers=1)
-        elif self.comu_type == 'conv1d_block':
-            print('=> Using COV1d_FusionBlock')
-            self.shift_block = CONV1d_FusionBlock(in_channels=net.in_channels, n_segment=n_segment, n_div=n_div)
-
-        elif self.comu_type == 'conv1d_channel_block':
-            print('=> Using COV1d_FusionBlock')
-            self.shift_block = CONV1d_Channel_FusionBlock(in_channels=net.in_channels, n_segment=n_segment, n_div=n_div)
-
-        elif self.comu_type == 'conv3d_block':
-            print('=> Using COV3d_FusionBlock')
-            self.shift_block = CONV3d_FusionBlock(in_channels=net.in_channels, n_segment=n_segment, n_div=n_div)
-
-        elif self.comu_type == 'emulated_2s':
-            print('=> Using Emulated_two_stream')
-            self.shift_block = Emulated_two_stream(in_channels=net.in_channels, n_segment=n_segment, n_div=n_div)
-        elif self.comu_type == 'FEX':
+        if self.comu_type == 'FEX':
             print('=> Using FEX')
             self.shift_block = FEX(in_channels=net.in_channels, n_segment=n_segment, n_div=n_div, is_first_block=is_first_block)
 
@@ -66,59 +33,8 @@ class TemporalShift(nn.Module):
         print('=> Using fold div: {}'.format(self.fold_div))
 
     def forward(self, x):
-        if self.comu_type == 'replace':
-            x = self.shift(x, self.n_segment, fold_div=self.fold_div, inplace=self.inplace)
-            return self.net(x)
-        if self.borrow_BN:
-            x = self.net(x)
-            return self.shift_block(x)
-        else:
-            x = self.shift_block(x)
-            return self.net(x)
-
-    @staticmethod
-    def shift(x, n_segment, fold_div=3, inplace=False, ):
-        nt, c, h, w = x.size()
-        n_batch = nt // n_segment
-        x = x.view(n_batch, n_segment, c, h, w)
-
-        fold = c // fold_div
-        if inplace:
-            # Due to some out of order error when performing parallel computing.
-            # May need to write a CUDA kernel.
-            raise NotImplementedError
-            # out = InplaceShift.apply(x, fold)
-        else:
-
-            out = torch.zeros_like(x)
-            out[:, :-1, :fold] = x[:, 1:, :fold]  # shift left
-            out[:, 1:, fold: 2 * fold] = x[:, :-1, fold: 2 * fold]  # shift right
-            out[:, :, 2 * fold:] = x[:, :, 2 * fold:]  # not shift
-
-        return out.view(nt, c, h, w)
-
-    @staticmethod
-    def motion_shift(x, n_segment, fold_div=3, inplace=False, ):
-        nt, c, h, w = x.size()
-        n_batch = nt // n_segment
-        x = x.view(n_batch, n_segment, c, h, w)
-
-        fold = c // fold_div
-        s_fold = fold // 2
-        if inplace:
-            # Due to some out of order error when performing parallel computing.
-            # May need to write a CUDA kernel.
-            raise NotImplementedError
-            # out = InplaceShift.apply(x, fold)
-        else:
-
-            out = torch.zeros_like(x)
-            out[:, :-1, 2 * fold:2 * fold + s_fold] = x[:, 1:, 2 * fold:2 * fold + s_fold]  # shift left
-            out[:, 1:, 2 * fold + s_fold:2 * fold + 2 * s_fold] = x[:, :-1,
-                                                                  2 * fold + s_fold:2 * fold + 2 * s_fold]  # shift right
-            out[:, :, 2 * fold + 2 * s_fold:] = x[:, :, 2 * fold + 2 * s_fold:]  # not shift
-
-        return out.view(nt, c, h, w)
+        x = self.shift_block(x)
+        return self.net(x)
 
 
 def make_temporal_shift(net, n_segment, n_div=8, place='blockres', temporal_pool=False, comu_type='replace'):
@@ -155,7 +71,7 @@ def make_temporal_shift(net, n_segment, n_div=8, place='blockres', temporal_pool
                                                         , comu_type=comu_type, is_first_block=True)
                     elif i % n_round == 0:
                         blocks[i].conv1 = TemporalShift(b.conv1, n_segment=this_segment, n_div=n_div
-                                                        , comu_type=comu_type, borrow_BN=borrow_BN)
+                                                        , comu_type=comu_type)
                 return nn.Sequential(*blocks)
 
             # net.layer1 = make_block_temporal(net.layer1, n_segment_list[0], comu_type=comu_type)
