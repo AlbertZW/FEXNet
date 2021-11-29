@@ -1,351 +1,433 @@
-from argSet import *
-from processing_data.dataset import DataSet
-from processing_data.transforms import *
+# Code for "TSM: Temporal Shift Module for Efficient Video Understanding"
+# arXiv:1811.08383
+# Ji Lin*, Chuang Gan, Song Han
+# {jilin, songhan}@mit.edu, ganchuang@csail.mit.edu
 
-import abc
 import os
+import time
 import shutil
-import numpy as np
-import torch
-import torchvision
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
+import torch.optim
+from torch.nn.utils import clip_grad_norm_
 
-class AverageMeter(object):
-	"""Computes and stores the average and current value"""
-	def __init__(self):
-		self.reset()
+from ops.dataset import TSNDataSet
+from ops.models import TSN
+from ops.transforms import *
+from opts import parser
+from ops import dataset_config
+from ops.utils import AverageMeter, accuracy
 
-	def reset(self):
-		self.val = 0
-		self.avg = 0
-		self.sum = 0
-		self.count = 0
+from tensorboardX import SummaryWriter
 
-	def update(self, val, n=1):
-		self.val = val
-		self.sum += val * n
-		self.count += n
-		self.avg = self.sum / self.count
-
-class MainFramework:
-	def __init__(self, args):
-		self.args = args
-
-		self.datasourceConfig = DatasourceConfig(self.args.dataset, self.args.modality)
-		self.classifier_filename = 'ckpt.pretrained_classif.pth.tar'
-		self.classifier_path = self.datasourceConfig.save_model_path
-
-		self.start_epoch = 0
-		self.best_prec1 = 0
-		self.epoch_train_losses = []
-		self.epoch_train_scores = []
-		self.epoch_test_losses = []
-		self.epoch_test_scores = []
-		# self.snapshot_pref = '_'.join((args.dataset, args.arch))
-
-		self.processing_model = None
-
-	@abc.abstractmethod
-	def _load_model(self):
-		pass
-
-	@abc.abstractmethod
-	def _apply_pretrained_model(self):
-		pass
-
-	@staticmethod
-	def _load_checkpoint(model, save_model_path, file_name, load_pretrained_backbone=False):
-		resume_path = os.path.join(save_model_path, file_name)
-		loading_status = False
-		start_epoch = 0
-		best_prec1 = 0
-
-		if os.path.isfile(resume_path):
-			loading_status = True
-			print(("=> loading checkpoint '{}'".format(resume_path)))
-			checkpoint = torch.load(resume_path)
-			checkpoint_dict = checkpoint['state_dict']
-
-			if load_pretrained_backbone:
-				model_dict = model.state_dict()
-
-				regarded_dict = {}
-				for k, v in checkpoint_dict.items():
-					for curr_k in model_dict.keys():
-						if k == curr_k and v.size() == model_dict[curr_k].size():
-							regarded_dict[k] = v
-
-				model_dict.update(regarded_dict)
-				model.load_state_dict(model_dict)
-			else:
-				start_epoch = checkpoint['epoch']
-				best_prec1 = checkpoint['best_prec1']
-				model.load_state_dict(checkpoint_dict)
-			print(("=> loaded checkpoint '{}'".format(file_name)))
-		else:
-			print(("=> no checkpoint found at '{}'".format(resume_path)))
-
-		return loading_status, start_epoch, best_prec1
+best_prec1 = 0
 
 
-	def _load_data(self, train, crop_size, scale_size, train_augmentation, normalize, data_length):
-		if train:
-			dataset = DataSet(self.datasourceConfig.data_path,
-						os.path.join(self.datasourceConfig.list_folder, self.args.train_list),
-						num_segments=self.args.num_segments,
-						new_length=data_length,
-						modality=self.args.modality,
-						image_tmpl=self.datasourceConfig.frame_format if self.args.modality in ["RGB", "RGBDiff"] else self.args.flow_prefix + "{}_{:05d}.jpg",
-						transform=torchvision.transforms.Compose([
-						  train_augmentation,
-						  Stack(roll=(self.args.arch in ['BNInception', 'InceptionV3'])),
-						  ToTorchFormatTensor(div=(self.args.arch not in ['BNInception', 'InceptionV3'])),
-						  normalize,
-						]))
-			dataloader = torch.utils.data.DataLoader(dataset=dataset,
-								batch_size=self.args.train_batch_size,
-								shuffle=True,
-								num_workers=self.args.workers, pin_memory=True)
+def main():
+    global args, best_prec1
+    args = parser.parse_args()
 
-		else:
-			dataset = DataSet(self.datasourceConfig.data_path,
-						os.path.join(self.datasourceConfig.list_folder, self.args.val_list),
-						num_segments=self.args.num_segments,
-						new_length=data_length,
-						modality=self.args.modality,
-						image_tmpl=self.datasourceConfig.frame_format if self.args.modality in ["RGB", "RGBDiff"] else self.args.flow_prefix + "{}_{:05d}.jpg",
-						random_shift=False,
-						transform=torchvision.transforms.Compose([
-							GroupScale(int(scale_size)),
-							GroupCenterCrop(crop_size),
-							Stack(roll=self.args.arch == 'BNInception'),
-							ToTorchFormatTensor(div=self.args.arch != 'BNInception'),
-							normalize,
-						]))
-			dataloader = torch.utils.data.DataLoader(dataset=dataset,
-								batch_size=self.args.val_batch_size,
-								shuffle=False,
-								num_workers=self.args.workers, pin_memory=True)
+    num_class, args.train_list, args.val_list, args.root_path, prefix = dataset_config.return_dataset(args.dataset,
+                                                                                                      args.modality)
+    full_arch_name = args.arch
+    if args.shift:
+        full_arch_name += '_shift{}_{}'.format(args.shift_div, args.shift_place)
+    if args.temporal_pool:
+        full_arch_name += '_tpool'
+    if args.add_se:
+        full_arch_name += '_addse'
+    full_arch_name += '_{}'.format(args.comu_type)
+    if args.follow_pretrain != '':
+        full_arch_name += '_fp'
+    args.store_name = '_'.join(
+        ['TSM', args.dataset, args.modality, full_arch_name, args.consensus_type, 'segment%d' % args.num_segments,
+         'e{}'.format(args.epochs)])
 
-		return dataloader
+    if args.pretrain != 'imagenet':
+        args.store_name += '_{}'.format(args.pretrain)
+    if args.lr_type != 'step':
+        args.store_name += '_{}'.format(args.lr_type)
+    if args.dense_sample:
+        args.store_name += '_dense'
+    if args.non_local > 0:
+        args.store_name += '_nl'
+    if args.suffix is not None:
+        args.store_name += '_{}'.format(args.suffix)
+    print('storing name: ' + args.store_name)
 
+    check_rootfolders()
 
-	def _set_dataloader(self, crop_size, scale_size, train_augmentation, normalize, data_length):
-		self.train_loader = self._load_data(train=True,
-		                                    crop_size=crop_size, scale_size=scale_size,
-		                                    train_augmentation=train_augmentation,
-		                                    normalize=normalize, data_length=data_length,
-		                                    )
-		self.val_loader = self._load_data(train=False,
-		                                  crop_size=crop_size, scale_size=scale_size,
-		                                  train_augmentation=train_augmentation,
-		                                  normalize=normalize, data_length=data_length,
-		                                  )
+    model = TSN(num_class, args.num_segments, args.modality,
+                base_model=args.arch,
+                consensus_type=args.consensus_type,
+                dropout=args.dropout,
+                img_feature_dim=args.img_feature_dim,
+                partial_bn=not args.no_partialbn,
+                pretrain=args.pretrain,
+                is_shift=args.shift, shift_div=args.shift_div, shift_place=args.shift_place,
+                fc_lr5=not (args.tune_from and args.dataset in args.tune_from),
+                temporal_pool=args.temporal_pool,
+                non_local=args.non_local,
+                comu_type=args.comu_type,
+                follow_pretrain=args.follow_pretrain,
+                add_se=args.add_se)
+    total_params = sum(p.numel() for p in model.base_model.parameters())
+    print("=======>params:{}".format(total_params))
+    crop_size = model.crop_size
+    scale_size = model.scale_size
+    input_mean = model.input_mean
+    input_std = model.input_std
+    policies = model.get_optim_policies_new()
+    train_augmentation = model.get_augmentation(
+        flip=False if 'something' in args.dataset or 'jester' in args.dataset else True)
 
+    model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
 
-	def _resume_training(self, cuda_model):
-		# filename = '_'.join((self.snapshot_pref, self.args.modality.lower(), 'checkpoint.pth.tar'))
-		filename = '_'.join((self.args.modality.lower(), 'checkpoint.pth.tar'))
-		resume_path = os.path.join(self.datasourceConfig.save_model_path, filename)
-		loading_status, start_epoch, best_prec1 = self._load_checkpoint(cuda_model, resume_path, filename)
-		if loading_status:
-			self.start_epoch = start_epoch
-			self.best_prec1 = best_prec1
-			self.epoch_train_losses = np.load(os.path.join(self.datasourceConfig.save_model_path, 'training_losses.npy')).tolist()
-			self.epoch_train_scores = np.load(os.path.join(self.datasourceConfig.save_model_path, 'training_scores.npy')).tolist()
-			self.epoch_test_losses = np.load(os.path.join(self.datasourceConfig.save_model_path, 'test_loss.npy')).tolist()
-			self.epoch_test_scores = np.load(os.path.join(self.datasourceConfig.save_model_path, 'test_score.npy')).tolist()
+    optimizer = torch.optim.SGD(policies,
+                                args.lr,
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay)
 
-	def _set_loss_function(self):
-		# define loss function (criterion) and optimizer
-		if self.args.loss_type == 'nll':
-			criterion = torch.nn.CrossEntropyLoss().cuda()
-		else:
-			raise ValueError("Unknown loss type")
-		return criterion
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(("=> loading checkpoint '{}'".format(args.resume)))
+            checkpoint = torch.load(args.resume)
+            args.start_epoch = checkpoint['epoch']
+            best_prec1 = checkpoint['best_prec1']
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print(("=> loaded checkpoint '{}' (epoch {})"
+                   .format(args.evaluate, checkpoint['epoch'])))
+        else:
+            print(("=> no checkpoint found at '{}'".format(args.resume)))
 
-	def _set_optimizer(self):
-		policies = self.processing_model.get_optim_policies()
+    if args.tune_from:
+        print(("=> fine-tuning from '{}'".format(args.tune_from)))
+        sd = torch.load(args.tune_from)
+        sd = sd['state_dict']
+        model_dict = model.state_dict()
+        replace_dict = []
+        for k, v in sd.items():
+            if k not in model_dict and k.replace('.net', '') in model_dict:
+                print('=> Load after remove .net: ', k)
+                replace_dict.append((k, k.replace('.net', '')))
+        for k, v in model_dict.items():
+            if k not in sd and k.replace('.net', '') in sd:
+                print('=> Load after adding .net: ', k)
+                replace_dict.append((k.replace('.net', ''), k))
 
-		for group in policies:
-			print(('group: {} has {} params, lr_mult: {}, decay_mult: {}'.format(
-				group['name'], len(group['params']), group['lr_mult'], group['decay_mult'])))
+        for k, k_new in replace_dict:
+            sd[k_new] = sd.pop(k)
+        keys1 = set(list(sd.keys()))
+        keys2 = set(list(model_dict.keys()))
+        set_diff = (keys1 - keys2) | (keys2 - keys1)
+        print('#### Notice: keys that failed to load: {}'.format(set_diff))
+        if args.dataset not in args.tune_from:  # new dataset
+            print('=> New dataset, do not load fc weights')
+            sd = {k: v for k, v in sd.items() if 'fc' not in k}
+        if args.modality == 'Flow' and 'Flow' not in args.tune_from:
+            sd = {k: v for k, v in sd.items() if 'conv1.weight' not in k}
+        model_dict.update(sd)
+        model.load_state_dict(model_dict)
 
-		optimizer = torch.optim.SGD(policies,
-		                            self.args.lr,
-		                            momentum=self.args.momentum,
-		                            weight_decay=self.args.weight_decay)
+    cudnn.benchmark = True
 
-		return optimizer
+    # Data loading code
+    if args.modality != 'RGBDiff':
+        normalize = GroupNormalize(input_mean, input_std)
+    else:
+        normalize = IdentityTransform()
 
-	@staticmethod
-	def _adjust_learning_rate(optimizer, epoch, arg_lr, lr_steps, arg_weight_decay):
-		"""Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-		decay = 0.1 ** (sum(epoch >= np.array(lr_steps)))
-		lr = arg_lr * decay
-		decay = arg_weight_decay
-		for param_group in optimizer.param_groups:
-			param_group['lr'] = lr * param_group['lr_mult']
-			param_group['weight_decay'] = decay * param_group['decay_mult']
+    if args.modality == 'RGB':
+        data_length = 1
+    elif args.modality in ['Flow', 'RGBDiff']:
+        data_length = 5
 
-	@staticmethod
-	def accuracy(output, target, topk=(1,)):
-		"""Computes the precision@k for the specified values of k"""
-		maxk = max(topk)
-		batch_size = target.size(0)
+    train_loader = torch.utils.data.DataLoader(
+        TSNDataSet(args.root_path, args.train_list, num_segments=args.num_segments,
+                   new_length=data_length,
+                   modality=args.modality,
+                   image_tmpl=prefix,
+                   transform=torchvision.transforms.Compose([
+                       train_augmentation,
+                       Stack(roll=(args.arch in ['BNInception', 'InceptionV3'])),
+                       ToTorchFormatTensor(div=(args.arch not in ['BNInception', 'InceptionV3'])),
+                       normalize,
+                   ]), dense_sample=args.dense_sample),
+        batch_size=args.batch_size, shuffle=True,
+        num_workers=args.workers, pin_memory=True,
+        drop_last=True)  # prevent something not % n_GPU
 
-		_, pred = output.topk(maxk, 1, True, True)
-		pred = pred.t()
-		correct = pred.eq(target.view(1, -1).expand_as(pred))
+    val_loader = torch.utils.data.DataLoader(
+        TSNDataSet(args.root_path, args.val_list, num_segments=args.num_segments,
+                   new_length=data_length,
+                   modality=args.modality,
+                   image_tmpl=prefix,
+                   random_shift=False,
+                   transform=torchvision.transforms.Compose([
+                       GroupScale(int(scale_size)),
+                       GroupCenterCrop(crop_size),
+                       Stack(roll=(args.arch in ['BNInception', 'InceptionV3'])),
+                       ToTorchFormatTensor(div=(args.arch not in ['BNInception', 'InceptionV3'])),
+                       normalize,
+                   ]), dense_sample=args.dense_sample),
+        batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True)
 
-		res = []
-		for k in topk:
-			correct_k = correct[:k].view(-1).float().sum(0)
-			res.append(correct_k.mul_(100.0 / batch_size))
-		return res
+    # define loss function (criterion) and optimizer
+    if args.loss_type == 'nll':
+        criterion = torch.nn.CrossEntropyLoss().cuda()
+    else:
+        raise ValueError("Unknown loss type")
 
-	@abc.abstractmethod
-	def train(self, train_loader, model, criterion, optimizer, epoch, clip_grad, print_freq):
-		pass
+    for group in policies:
+        print(('group: {} has {} params, lr_mult: {}, decay_mult: {}'.format(
+            group['name'], len(group['params']), group['lr_mult'], group['decay_mult'])))
 
-	@abc.abstractmethod
-	def validate(self, val_loader, model, criterion, iter, print_freq):
-		pass
+    if args.evaluate:
+        validate(val_loader, model, criterion, 0)
+        return
 
-	@staticmethod
-	def save_checkpoint(state, is_best, modality, save_model_path, epoch=0, filename='checkpoint.pth.tar'):
-		filename = '_'.join((modality.lower(), filename))
-		file_path = os.path.join(save_model_path, filename)
-		torch.save(state, file_path)
-		if is_best:
-			best_name = '_'.join((modality.lower(), 'model_best.pth.tar'))
-			best_path = os.path.join(save_model_path, best_name)
-			shutil.copyfile(file_path, best_path)
+    log_training = open(os.path.join(args.root_log, args.store_name, 'log.csv'), 'w')
+    with open(os.path.join(args.root_log, args.store_name, 'args.txt'), 'w') as f:
+        f.write(str(args))
+    tf_writer = SummaryWriter(log_dir=os.path.join(args.root_log, args.store_name))
+    for epoch in range(args.start_epoch, args.epochs):
+        adjust_learning_rate(optimizer, epoch, args.lr_type, args.lr_steps,
+                             follow_pretrain=False if args.follow_pretrain == '' else True)
 
-	def main(self):
-		# base_model (backbone) only refers to the 2D CNN, RL backbone is always set to ResNet18
-		self._load_model()
+        # train for one epoch
+        train(train_loader, model, criterion, optimizer, epoch, log_training, tf_writer)
 
-		processing_model = torch.nn.DataParallel(self.processing_model, device_ids=self.args.gpus).cuda()
+        # evaluate on validation set
+        if (epoch + 1) % args.eval_freq == 0 or epoch == args.epochs - 1:
+            prec1 = validate(val_loader, model, criterion, epoch, log_training, tf_writer)
 
-		if self.args.resume:
-			self._resume_training(processing_model)
+            # remember best prec@1 and save checkpoint
+            is_best = prec1 > best_prec1
+            best_prec1 = max(prec1, best_prec1)
+            tf_writer.add_scalar('acc/test_top1_best', best_prec1, epoch)
 
-		if self.args.applyPretrainedModel:
-			self._apply_pretrained_model()
+            output_best = 'Best Prec@1: %.3f\n' % (best_prec1)
+            print(output_best)
+            log_training.write(output_best + '\n')
+            log_training.flush()
 
-		cudnn.benchmark = True
-
-		crop_size = self.processing_model.crop_size
-		scale_size = self.processing_model.scale_size
-		# input_mean = self.processing_model.input_mean
-		# input_std = self.processing_model.input_std
-
-		train_augmentation = self.processing_model.get_augmentation(
-			flip=False if 'something' in self.args.dataset else True, type='spatial')
-
-		# Data loading code
-		normalize = IdentityTransform()
-
-		if self.args.modality == 'RGB':
-			data_length = 1
-		elif self.args.modality in ['Flow', 'RGBDiff']:
-			data_length = 5
-
-		self._set_dataloader(crop_size=crop_size, scale_size=scale_size,
-		                     train_augmentation=train_augmentation,
-		                     normalize=normalize, data_length=data_length)
-
-		criterion = self._set_loss_function()
-		optimizer = self._set_optimizer()
-
-		if self.args.evaluate:
-			# filename = '_'.join((self.snapshot_pref, self.args.modality.lower(), 'model_best.pth.tar'))
-			filename = '_'.join((self.args.modality.lower(), 'model_best.pth.tar'))
-			self._load_checkpoint(self.processing_model, self.datasourceConfig.save_model_path, filename)
-
-			self.validate(self.val_loader, processing_model, criterion, 0, self.args.print_freq)
-			return
-
-		for epoch in range(self.start_epoch, self.args.epochs):
-			MainFramework._adjust_learning_rate(optimizer, epoch, self.args.lr, self.args.lr_steps, self.args.weight_decay)
-
-			# train for one epoch
-			train_accu, train_loss = self.train(self.train_loader, processing_model, criterion, optimizer, epoch,
-												self.args.clip_gradient, self.args.print_freq)
-
-			self.epoch_train_losses.append(train_loss)
-			self.epoch_train_scores.append(train_accu)
-
-			tmp_training_loss_path = os.path.join(self.datasourceConfig.save_model_path, 'tmp_training_losses.npy')
-			tmp_training_score_path = os.path.join(self.datasourceConfig.save_model_path, 'tmp_training_scores.npy')
-			np.save(tmp_training_loss_path, np.array(self.epoch_train_losses))
-			np.save(tmp_training_score_path, np.array(self.epoch_train_scores))
-
-			# evaluate on validation set
-			if (epoch + 1) % self.args.eval_freq == 0 or epoch == self.args.epochs - 1:
-				prec1, val_loss = self.validate(self.val_loader, processing_model, criterion, (epoch + 1) * len(self.train_loader),
-		                                   self.args.print_freq)
-
-				self.epoch_test_losses.append(val_loss)
-				self.epoch_test_scores.append(prec1)
-				np.save(os.path.join(self.datasourceConfig.save_model_path, 'test_loss.npy'), np.array(self.epoch_test_losses))
-				np.save(os.path.join(self.datasourceConfig.save_model_path, 'test_score.npy'), np.array(self.epoch_test_scores))
-
-				training_loss_path = os.path.join(self.datasourceConfig.save_model_path, 'training_losses.npy')
-				training_score_path = os.path.join(self.datasourceConfig.save_model_path, 'training_scores.npy')
-				shutil.copyfile(tmp_training_loss_path, training_loss_path)
-				shutil.copyfile(tmp_training_score_path, training_score_path)
-
-				# remember best prec@1 and save checkpoint
-				is_best = prec1 > self.best_prec1
-				if is_best:
-					self.best_prec1 = prec1
-				MainFramework.save_checkpoint({
-					'epoch': epoch + 1,
-					'arch': self.args.arch,
-					'state_dict': processing_model.state_dict(),
-					'best_prec1': self.best_prec1,
-				#}, is_best, self.snapshot_pref, self.args.modality, self.datasourceConfig.save_model_path, epoch)
-				}, is_best, self.args.modality, self.datasourceConfig.save_model_path, epoch)
+            save_checkpoint(epoch + 1,
+            {
+                'epoch': epoch + 1,
+                'arch': args.arch,
+                'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'best_prec1': best_prec1,
+            }, is_best)
 
 
+def train(train_loader, model, criterion, optimizer, epoch, log, tf_writer):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
 
-if __name__ == "__main__":
-	global_args = argSet(
-		############################################
-		# the actual parameters for somethingV1 implementation
-		# dataset='somethingV1',
-		# segment_num=8,
-		# dropout=0.8,
-		# backbone_arch='resnet50',
-		# # backbone_arch='BNInception',
-		# gpus=[0, 1],
-		# epochs=60,
-		# train_batch_size=32,
-		# val_batch_size=128,
-		# lr_steps=[30, 50],
-		###########################################
-		dataset='UCF101',
-		# dataset='Kinetics400',
-		segment_num=8,
-		dropout=0.8,
-		arch='resnet50',
-		# arch='BNInception',
-		gpus=[0],
-		epochs=60,
-		train_batch_size=2,
-		val_batch_size=16,
-		lr_steps=[30, 50],
-		# resume=True,
-		# evaluate=True,
+    if args.no_partialbn:
+        model.module.partialBN(False)
+    else:
+        model.module.partialBN(True)
 
-		applyPretrainedModel=False,
-	)
+    # switch to train mode
+    model.train()
 
-	import E2EMain
-	mainframework = E2EMain.E2EImplementation(global_args)
+    if epoch<args.lr_steps[0] and args.follow_pretrain!='':
+        model.module.first_fit()
 
-	mainframework.main()
+    end = time.time()
+    for i, (input, target) in enumerate(train_loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
 
+        target = target.cuda()
+        input_var = torch.autograd.Variable(input)
+        target_var = torch.autograd.Variable(target)
+
+        # with torch.autograd.detect_anomaly():
+        # compute output
+        output = model(input_var)
+        loss = criterion(output, target_var)
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+        losses.update(loss.item(), input.size(0))
+        top1.update(prec1.item(), input.size(0))
+        top5.update(prec5.item(), input.size(0))
+
+        # compute gradient and do SGD step
+        loss.backward()
+
+        if args.clip_gradient is not None:
+            total_norm = clip_grad_norm_(model.parameters(), args.clip_gradient)
+
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            output = ('Epoch: [{0}][{1}/{2}], lr: {lr:.5f}\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                epoch, i, len(train_loader), batch_time=batch_time,
+                data_time=data_time, loss=losses, top1=top1, top5=top5,
+                lr=optimizer.param_groups[0]['lr'] ))  # TODO
+            print(output)
+            log.write(output + '\n')
+            log.flush()
+
+    tf_writer.add_scalar('loss/train', losses.avg, epoch)
+    tf_writer.add_scalar('acc/train_top1', top1.avg, epoch)
+    tf_writer.add_scalar('acc/train_top5', top5.avg, epoch)
+    tf_writer.add_scalar('lr', optimizer.param_groups[0]['lr'], epoch)
+
+
+def validate(val_loader, model, criterion, epoch, log=None, tf_writer=None):
+    batch_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    # switch to evaluate mode
+    model.eval()
+
+    end = time.time()
+    with torch.no_grad():
+        for i, (input, target) in enumerate(val_loader):
+            target = target.cuda()
+
+            # compute output
+            output = model(input)
+            loss = criterion(output, target)
+
+            # measure accuracy and record loss
+            prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+
+            losses.update(loss.item(), input.size(0))
+            top1.update(prec1.item(), input.size(0))
+            top5.update(prec5.item(), input.size(0))
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                output = ('Test: [{0}/{1}]\t'
+                          'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                          'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                          'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                          'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                    i, len(val_loader), batch_time=batch_time, loss=losses,
+                    top1=top1, top5=top5))
+                print(output)
+                if log is not None:
+                    log.write(output + '\n')
+                    log.flush()
+
+    output = ('Testing Results: Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Loss {loss.avg:.5f}'
+              .format(top1=top1, top5=top5, loss=losses))
+    print(output)
+    if log is not None:
+        log.write(output + '\n')
+        log.flush()
+
+    if tf_writer is not None:
+        tf_writer.add_scalar('loss/test', losses.avg, epoch)
+        tf_writer.add_scalar('acc/test_top1', top1.avg, epoch)
+        tf_writer.add_scalar('acc/test_top5', top5.avg, epoch)
+
+    return top1.avg
+
+
+def save_checkpoint(epoch, state, is_best):
+    filename = '%s/%s/ckpt.pth' % (args.root_model, args.store_name)
+    torch.save(state, filename)
+    if is_best:
+        torch.save(state, filename.replace('.pth', 'best.pth'))
+    if epoch == 20 or epoch == 35 or epoch == 40:
+        filename = '%s/%s/ckpt_%s.pth' % (args.root_model, args.store_name, str(epoch))
+        torch.save(state, filename)
+
+
+def adjust_learning_rate(optimizer, epoch, lr_type, lr_steps, follow_pretrain=False):
+    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+    if follow_pretrain:
+        if lr_type == 'step':
+            decay = 0.1 ** (sum(epoch >= np.array(lr_steps)))
+            lr = args.lr * decay
+            decay = args.weight_decay
+        elif lr_type == 'cos':
+            import math
+            lr = 0.5 * args.lr * (1 + math.cos(math.pi * epoch / args.epochs))
+            decay = args.weight_decay
+        else:
+            raise NotImplementedError
+        for param_group in optimizer.param_groups:
+            if param_group['is_backbone']:
+                if epoch < lr_steps[0]:
+                    param_group['lr'] = 0
+                    print('epoch: {}, lr: {}. Do not update {}'.format(epoch, param_group['lr'], param_group['name']))
+                else:
+                    param_group['lr'] = lr * param_group['lr_mult']
+                    param_group['weight_decay'] = decay * param_group['decay_mult']
+                    print('epoch: {}, lr: {}. update {}'.format(epoch, param_group['lr'], param_group['name']))
+            # elif param_group['name'] == 'lr5_weight' or param_group['name'] == 'lr10_bias':
+            #     if epoch < lr_steps[0]:
+            #         param_group['lr'] = 0
+            #         print('epoch: {}, lr: {}. Do not update {}'.format(epoch, param_group['lr'], param_group['name']))
+            #     elif epoch < lr_steps[1]:
+            #         param_group['lr'] = lr * param_group['lr_mult']*0.1
+            #         param_group['weight_decay'] = decay * param_group['decay_mult']
+            #         print('epoch: {}, lr: {}. update {} with normal lr'.format(epoch, param_group['lr'], param_group['name']))
+            #     else:
+            #         param_group['lr'] = lr * param_group['lr_mult']
+            #         param_group['weight_decay'] = decay * param_group['decay_mult']
+            #         print('epoch: {}, lr: {}. update {}'.format(epoch, param_group['lr'], param_group['name']))
+
+            else:
+                param_group['lr'] = lr * param_group['lr_mult']
+                param_group['weight_decay'] = decay * param_group['decay_mult']
+                print('epoch: {}, lr: {}. update {}'.format(epoch, param_group['lr'], param_group['name']))
+
+    else:
+        if lr_type == 'step':
+            decay = 0.1 ** (sum(epoch >= np.array(lr_steps)))
+            lr = args.lr * decay
+            decay = args.weight_decay
+        elif lr_type == 'cos':
+            import math
+            lr = 0.5 * args.lr * (1 + math.cos(math.pi * epoch / args.epochs))
+            decay = args.weight_decay
+        else:
+            raise NotImplementedError
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr * param_group['lr_mult']
+            param_group['weight_decay'] = decay * param_group['decay_mult']
+            print('epoch: {}, lr: {}. update {}'.format(epoch, param_group['lr'], param_group['name']))
+
+
+def check_rootfolders():
+    """Create log and model folder"""
+    folders_util = [args.root_log, args.root_model,
+                    os.path.join(args.root_log, args.store_name),
+                    os.path.join(args.root_model, args.store_name)]
+    for folder in folders_util:
+        if not os.path.exists(folder):
+            print('creating folder ' + folder)
+            os.mkdir(folder)
+
+
+if __name__ == '__main__':
+    main()

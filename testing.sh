@@ -1,0 +1,1 @@
+python test_models.py something --weights=./checkpoint/TSM_something_RGB_resnet50_shift6_blockres_FEX_avg_segment8_e50/ckptbest.pth --test_segments=8 --test_crops=3 --batch_size 3 --twice_sample --full_res --comu_type Emulated_two_stream
