@@ -45,7 +45,7 @@ def return_hmdb51(modality):
 
 
 def return_something(modality):
-    filename_categories = 'somethin-something-v1/category.txt'
+    filename_categories = 'something-something-v1/category.txt'
     if modality == 'RGB':
         root_data = 'D:\\_DataSources\\something\\v1\\20bn-something-something-v1'
         # root_data = '/data/Disk_C/something/20bn-something-something-v1'
