@@ -77,7 +77,6 @@ parser.add_argument('--non_local', default=False, action="store_true", help='add
 parser.add_argument('--dense_sample', default=False, action="store_true", help='use dense sample for video dataset')
 
 # ========================= fusion config ==========================
-parser.add_argument('--comu_type', default='replace', type=str)
 parser.add_argument('--follow_pretrain', default='', type=str, metavar='PATH',
                     help='model that has been trained on TSN/TSM')
 parser.add_argument('--add_se', default=False, action="store_true", help='add_se ')

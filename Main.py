@@ -36,7 +36,7 @@ def main():
         full_arch_name += '_tpool'
     if args.add_se:
         full_arch_name += '_addse'
-    full_arch_name += '_{}'.format(args.comu_type)
+    full_arch_name += '_FEX'
     if args.follow_pretrain != '':
         full_arch_name += '_fp'
     args.store_name = '_'.join(
@@ -68,7 +68,6 @@ def main():
                 fc_lr5=not (args.tune_from and args.dataset in args.tune_from),
                 temporal_pool=args.temporal_pool,
                 non_local=args.non_local,
-                comu_type=args.comu_type,
                 follow_pretrain=args.follow_pretrain,
                 add_se=args.add_se)
     total_params = sum(p.numel() for p in model.base_model.parameters())

@@ -102,14 +102,14 @@ class FEX(nn.Module):
 		self.n_segment = n_segment
 		self.fold = in_channels // n_div
 
-		# self.attention_model = FE(in_channels=in_channels, n_segment=n_segment, n_div=16)
+		self.attention_model = FE(in_channels=in_channels, n_segment=n_segment, n_div=16)
 		self.ST_model = SS(in_channels=in_channels, n_segment=n_segment, n_div=n_div)
 
 		self.is_first_block = is_first_block
 
 	def forward(self, x):
-		# if self.is_first_block:
-		# 	x = self.attention_model(x)
+		if self.is_first_block:
+			x = self.attention_model(x)
 		x = self.ST_model(x)
 
 		return x

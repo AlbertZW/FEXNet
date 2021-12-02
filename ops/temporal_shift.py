@@ -11,22 +11,15 @@ from ops.fex import FEX
 
 
 class TemporalShift(nn.Module):
-    def __init__(self, net, n_segment=3, n_div=8, inplace=False, comu_type='replace', is_first_block=False):
+    def __init__(self, net, n_segment=3, n_div=8, inplace=False, is_first_block=False):
         super(TemporalShift, self).__init__()
         self.net = net
         self.n_segment = n_segment
         self.fold_div = n_div
         self.inplace = inplace
 
-        self.comu_type = comu_type
-        # self.is_first_block = is_first_block
-
-        if self.comu_type == 'FEX':
-            print('=> Using FEX')
-            self.shift_block = FEX(in_channels=net.in_channels, n_segment=n_segment, n_div=n_div, is_first_block=is_first_block)
-
-        else:
-            raise NotImplementedError
+        print('=> Using FEX')
+        self.shift_block = FEX(in_channels=net.in_channels, n_segment=n_segment, n_div=n_div, is_first_block=is_first_block)
 
         if inplace:
             print('=> Using in-place shift...')
@@ -37,7 +30,7 @@ class TemporalShift(nn.Module):
         return self.net(x)
 
 
-def make_temporal_shift(net, n_segment, n_div=8, place='blockres', temporal_pool=False, comu_type='replace'):
+def make_temporal_shift(net, n_segment, n_div=8, place='blockres', temporal_pool=False):
     if temporal_pool:
         n_segment_list = [n_segment, n_segment // 2, n_segment // 2, n_segment // 2]
     else:
@@ -48,58 +41,28 @@ def make_temporal_shift(net, n_segment, n_div=8, place='blockres', temporal_pool
     import torchvision
     if isinstance(net, torchvision.models.ResNet):
 
-        print("==> using comutype:{}".format(comu_type))
+        print("==> using FEX.")
 
-        if 'BB' in place:
-            borrow_BN=True
-            print("=>Borrow BN!!!")
-        else:
-            borrow_BN=False
-
-        if 'inblockres' in place and borrow_BN:
+        if 'inblockres' in place:
             n_round = 1
             if len(list(net.layer3.children())) >= 23:
                 n_round = 2
                 print('=> Using n_round {} to insert temporal shift'.format(n_round))
 
-            def make_block_temporal(stage, this_segment, comu_type='replace'):
+            def make_block_temporal(stage, this_segment):
                 blocks = list(stage.children())
                 print('=> Processing stage with {} blocks residual'.format(len(blocks)))
                 for i, b in enumerate(blocks):
                     if i == 0:
-                        blocks[i].conv1 = TemporalShift(b.conv1, n_segment=this_segment, n_div=n_div
-                                                        , comu_type=comu_type, is_first_block=True)
+                        blocks[i].conv1 = TemporalShift(b.conv1, n_segment=this_segment, n_div=n_div, is_first_block=True)
                     elif i % n_round == 0:
-                        blocks[i].conv1 = TemporalShift(b.conv1, n_segment=this_segment, n_div=n_div
-                                                        , comu_type=comu_type)
+                        blocks[i].conv2 = TemporalShift(b.conv2, n_segment=this_segment, n_div=n_div)
                 return nn.Sequential(*blocks)
 
-            # net.layer1 = make_block_temporal(net.layer1, n_segment_list[0], comu_type=comu_type)
-            # net.layer2 = make_block_temporal(net.layer2, n_segment_list[1], comu_type=comu_type)
-            net.layer3 = make_block_temporal(net.layer3, n_segment_list[2], comu_type=comu_type)
-            net.layer4 = make_block_temporal(net.layer4, n_segment_list[3], comu_type=comu_type)
-        elif 'inblockres' in place and not borrow_BN:
-            n_round = 1
-            if len(list(net.layer3.children())) >= 23:
-                n_round = 2
-                print('=> Using n_round {} to insert temporal shift'.format(n_round))
-
-            def make_block_temporal(stage, this_segment, comu_type='replace'):
-                blocks = list(stage.children())
-                print('=> Processing stage with {} blocks residual'.format(len(blocks)))
-                for i, b in enumerate(blocks):
-                    if i == 0:
-                        blocks[i].conv1 = TemporalShift(b.conv1, n_segment=this_segment, n_div=n_div
-                                                        , comu_type=comu_type, is_first_block=True)
-                    elif i % n_round == 0:
-                        blocks[i].conv2 = TemporalShift(b.conv2, n_segment=this_segment, n_div=n_div
-                                                        , comu_type=comu_type)
-                return nn.Sequential(*blocks)
-
-            # net.layer1 = make_block_temporal(net.layer1, n_segment_list[0], comu_type=comu_type)
-            # net.layer2 = make_block_temporal(net.layer2, n_segment_list[1], comu_type=comu_type)
-            net.layer3 = make_block_temporal(net.layer3, n_segment_list[2], comu_type=comu_type)
-            net.layer4 = make_block_temporal(net.layer4, n_segment_list[3], comu_type=comu_type)
+            # net.layer1 = make_block_temporal(net.layer1, n_segment_list[0])
+            # net.layer2 = make_block_temporal(net.layer2, n_segment_list[1])
+            net.layer3 = make_block_temporal(net.layer3, n_segment_list[2])
+            net.layer4 = make_block_temporal(net.layer4, n_segment_list[3])
 
         elif 'blockres' in place:
             n_round = 1
@@ -107,22 +70,20 @@ def make_temporal_shift(net, n_segment, n_div=8, place='blockres', temporal_pool
                 n_round = 2
                 print('=> Using n_round {} to insert temporal shift'.format(n_round))
 
-            def make_block_temporal(stage, this_segment, comu_type='replace'):
+            def make_block_temporal(stage, this_segment):
                 blocks = list(stage.children())
                 print('=> Processing stage with {} blocks residual'.format(len(blocks)))
                 for i, b in enumerate(blocks):
                     if i == 0:
-                        blocks[i].conv1 = TemporalShift(b.conv1, n_segment=this_segment, n_div=n_div
-                                                        , comu_type=comu_type, is_first_block=True)
+                        blocks[i].conv1 = TemporalShift(b.conv1, n_segment=this_segment, n_div=n_div, is_first_block=True)
                     elif i % n_round == 0:
-                        blocks[i].conv1 = TemporalShift(b.conv1, n_segment=this_segment, n_div=n_div
-                                                        , comu_type=comu_type)
+                        blocks[i].conv1 = TemporalShift(b.conv1, n_segment=this_segment, n_div=n_div)
                 return nn.Sequential(*blocks)
 
-            # net.layer1 = make_block_temporal(net.layer1, n_segment_list[0], comu_type=comu_type)
-            # net.layer2 = make_block_temporal(net.layer2, n_segment_list[1], comu_type=comu_type)
-            net.layer3 = make_block_temporal(net.layer3, n_segment_list[2], comu_type=comu_type)
-            net.layer4 = make_block_temporal(net.layer4, n_segment_list[3], comu_type=comu_type)
+            # net.layer1 = make_block_temporal(net.layer1, n_segment_list[0])
+            # net.layer2 = make_block_temporal(net.layer2, n_segment_list[1])
+            net.layer3 = make_block_temporal(net.layer3, n_segment_list[2])
+            net.layer4 = make_block_temporal(net.layer4, n_segment_list[3])
         else:
             raise NotImplementedError(place)
     else:

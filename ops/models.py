@@ -40,7 +40,7 @@ class TSN(nn.Module):
                  dropout=0.8, img_feature_dim=256,
                  crop_num=1, partial_bn=True, print_spec=True, pretrain='imagenet',
                  is_shift=False, shift_div=8, shift_place='blockres', fc_lr5=False,
-                 temporal_pool=False, non_local=False, comu_type='replace', follow_pretrain='',add_se=False):
+                 temporal_pool=False, non_local=False, follow_pretrain='',add_se=False):
         super(TSN, self).__init__()
         self.modality = modality
         self.num_segments = num_segments
@@ -62,8 +62,6 @@ class TSN(nn.Module):
         self.add_se=add_se
 
         self.bg_loss = 0
-
-        self.comu_type = comu_type
         self.follow_pretrain = follow_pretrain
 
         if not before_softmax and consensus_type != 'avg':
@@ -138,8 +136,7 @@ class TSN(nn.Module):
                 print('Adding temporal shift...')
                 from ops.temporal_shift import make_temporal_shift
                 make_temporal_shift(self.base_model, self.num_segments,
-                                    n_div=self.shift_div, place=self.shift_place, temporal_pool=self.temporal_pool,
-                                    comu_type=self.comu_type)
+                                    n_div=self.shift_div, place=self.shift_place, temporal_pool=self.temporal_pool)
             if self.non_local:
                 print('Adding non-local module...')
                 from ops.non_local import make_non_local
