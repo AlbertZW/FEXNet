@@ -50,8 +50,8 @@ def return_something(modality):
         root_data = 'D:\\_DataSources\\something\\v1\\20bn-something-something-v1'
         # root_data = '/data/Disk_C/something/20bn-something-something-v1'
         # root_data = '/home/action_data/somthing/v1/20bn-something-something-v1'
-        filename_imglist_train = 'somethin-something-v1/train_videofolder.txt'
-        filename_imglist_val = 'somethin-something-v1/val_videofolder.txt'
+        filename_imglist_train = 'something-something-v1/train_videofolder.txt'
+        filename_imglist_val = 'something-something-v1/val_videofolder.txt'
         prefix = '{:05d}.jpg'
     elif modality == 'Flow':
         root_data = ROOT_DATASET + 'something/v1/20bn-something-something-v1-flow'
