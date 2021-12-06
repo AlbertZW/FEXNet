@@ -61,7 +61,8 @@ class TSN(nn.Module):
         self.non_local = non_local
         self.add_se=add_se
 
-        self.bg_loss = 0
+        self.target_transforms = {86:87,87:86,93:94,94:93,166:167,167:166}
+
         self.follow_pretrain = follow_pretrain
 
         if not before_softmax and consensus_type != 'avg':
@@ -556,8 +557,8 @@ class TSN(nn.Module):
                 return torchvision.transforms.Compose([GroupMultiScaleCrop(self.input_size, [1, .875, .75, .66]),
                                                        GroupRandomHorizontalFlip(is_flow=False)])
             else:
-                print('#' * 20, 'NO FLIP!!!')
-                return torchvision.transforms.Compose([GroupMultiScaleCrop(self.input_size, [1, .875, .75, .66])])
+                return torchvision.transforms.Compose([GroupMultiScaleCrop(self.input_size, [1, .875, .75, .66]),
+                                                       GroupRandomHorizontalFlip_sth(self.target_transforms)])
         elif self.modality == 'Flow':
             return torchvision.transforms.Compose([GroupMultiScaleCrop(self.input_size, [1, .875, .75]),
                                                    GroupRandomHorizontalFlip(is_flow=True)])
