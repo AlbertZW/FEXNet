@@ -6,7 +6,7 @@ We release the PyTorch code of [FEXNet](https://ieeexplore.ieee.org/abstract/doc
 ![](./images/SS.png)
 ![](./images/FE.png)
 
-The code is majorly based on [TSM](https://github.com/mit-han-lab/temporal-shift-module). The proposed **Foreground EXtraction** blocks contains **Scene Segregation** and **Foreground Enhancement** modules to extract foreground features in different aspects.
+The code is majorly based on [TSM](https://github.com/mit-han-lab/temporal-shift-module). The proposed **Foreground EXtraction** blocks contains **Scene Segregation** and **Foreground Enhancement** modules to extract foreground features in different aspects as shown in the figures above.
 
 The detailed data pre-processing and preperation strategies follow the settings of [TSM](https://github.com/mit-han-lab/temporal-shift-module).
 
