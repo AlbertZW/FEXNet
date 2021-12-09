@@ -60,7 +60,7 @@ def make_temporal_shift(net, n_segment, n_div=8, place='blockres', temporal_pool
                 return nn.Sequential(*blocks)
 
             # net.layer1 = make_block_temporal(net.layer1, n_segment_list[0])
-            # net.layer2 = make_block_temporal(net.layer2, n_segment_list[1])
+            net.layer2 = make_block_temporal(net.layer2, n_segment_list[1])
             net.layer3 = make_block_temporal(net.layer3, n_segment_list[2])
             net.layer4 = make_block_temporal(net.layer4, n_segment_list[3])
 
@@ -81,7 +81,7 @@ def make_temporal_shift(net, n_segment, n_div=8, place='blockres', temporal_pool
                 return nn.Sequential(*blocks)
 
             # net.layer1 = make_block_temporal(net.layer1, n_segment_list[0])
-            # net.layer2 = make_block_temporal(net.layer2, n_segment_list[1])
+            net.layer2 = make_block_temporal(net.layer2, n_segment_list[1])
             net.layer3 = make_block_temporal(net.layer3, n_segment_list[2])
             net.layer4 = make_block_temporal(net.layer4, n_segment_list[3])
         else:
