@@ -138,7 +138,6 @@ def main():
                   pretrain=args.pretrain,
                   is_shift=is_shift, shift_div=shift_div, shift_place=shift_place,
                   non_local='_nl' in this_weights,
-                  comu_type=args.comu_type,
                   add_se=args.add_se
                   )
 
